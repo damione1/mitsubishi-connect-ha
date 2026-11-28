@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Mitsubishi Connect",
+        "description": "Use a dedicated secondary driver account created in the official Mitsubishi Motors app so your mobile app stays signed in.",
+        "data": {
+          "region": "Region",
+          "email": "Email",
+          "password": "Password",
+          "pin": "4-digit Security PIN (optional, required for remote engine start & unlock)",
+          "scan_interval": "Passive telemetry poll interval (minutes, min 15)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Mitsubishi Connect",
+        "description": "Your Mitsubishi Connect session for {email} expired or was signed out. Enter your password to reconnect.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "cannot_connect": "Unable to reach Mitsubishi Connect servers.",
+      "unknown": "Unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This Mitsubishi Connect account is already configured.",
+      "reauth_successful": "Reauthentication succeeded."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Mitsubishi Connect Options",
+        "data": {
+          "pin": "4-digit Security PIN",
+          "scan_interval": "Passive telemetry poll interval (minutes, min 15)",
+          "temperature_unit": "Preferred cabin temperature unit"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,276 @@
+# Regional backend and locale configuration for Mitsubishi Motors Connected Services.
+# Override any field via a custom TOML file (--config / MITSUBISHI_CONFIG),
+# CLI flags (--region, --country, --locale, --timezone), or environment variables.
+#
+# A region profile is resolved as [app] + [backends.<backend>] + [regions.<name>],
+# later tables overriding earlier ones. Each key and secret is declared once.
+
+default_region = "us"
+
+# Shared by every backend
+[app]
+package_name = "com.mitsubishi_motors.mitsubishimotors"
+app_name = "Mitsubishi Motors"
+app_version = "3.2.0"
+app_version_code = "132"
+user_agent = "okhttp/4.12.0"
+device_model = "Pixel 8"
+device_os_version = "14"
+device_api_level = "34"
+idm_aes_key = "enc:K0QpbS0MPAgwCSxDQBdTHFgWUixIJwckQiUPNQcnSiQ="
+kintaro_app_hash = "enc:KCtXGFBdWFlUWkRoM1dRKlssQyxeJm8mWVsrViVHFEM="
+jwt_sign_key = "enc:CQVUfxIrVx8xBCZaAwkvCAYKBV4FOmEzXywHBgQff0s="
+
+# North America (US, CA)
+[backends.na]
+idm_base_url = "https://idm.prod.goa-na.mitsubishi-motors.com"
+idm_client_id = "enc:Kl8gWCU6IV4yFycYMAAvLjkqNAY7UFsPPCU2PQwDTCI="
+idm_client_secret = "enc:DwMUQQoCNgwTAQxLQwsUXD0EMV4KD05VNiIgBCEtVzQtVwoZHjULNztlWiheGREaM09ADhQKOiYaDFQCQDIHJw=="
+kintaro_base_url = "https://kintaro.prod.goa-na.mitsubishi-motors.com/prod"
+kintaro_app_code = "enc:X11RG1NdXFtVUUEfQFVXWVZdS1Rc"
+kintaro_iv = "enc:XA9SSFQOWl9VVRJLSgADDA=="
+kintaro_sec_cfg = [7, 23, 4, 19, 9, 29, 3, 29, 2, 2]
+
+# Europe
+[backends.eu]
+idm_base_url = "https://idm.prod.goa-eu.mitsubishi-motors.com"
+idm_client_id = "enc:JxcufBo3Kg0oViZOHzMfMw0UHyAPM0MaOQYkBDQdYxc="
+idm_client_secret = "enc:JiYmXDleBQFdUDVhPSAsPQoEGQcLLX0xJAMvPCkeZztUUjwqKjteARVlFx4IJAIEDV5HFDVeASUBPDlRSBMZFA=="
+kintaro_base_url = "https://kintaro.prod.goa-eu.mitsubishi-motors.com/prod"
+kintaro_app_code = "enc:X11RGFNeX15VVEQdRlJSXFxaSllf"
+kintaro_iv = "enc:CQlVHAFaWwpSVRcfRQNTWg=="
+kintaro_sec_cfg = [15, 31, 18, 22, 0, 13, 1, 5, 7, 7]
+
+# Japan / Asia-Pacific (JP, TH, AU)
+[backends.jp]
+idm_base_url = "https://idm.prod.goa.mitsubishi-motors.com"
+idm_client_id = "enc:PwNVehocBw83VAxpAB9UUCYIQAleBUIyHBsmKSIeRAU="
+idm_client_secret = "enc:ADdVQwUpXAkWBwR0SgYWKyU3OCw8Fx0XJCALHSw2ZAYgEScjBTsOASUfMAFdKwIFR2sFET4HLAogAQkveVs3Kw=="
+kintaro_base_url = "https://kintaro.prod.goa.mitsubishi-motors.com/prod"
+kintaro_app_code = "enc:X11RGVJeXF5UUEUZQFxTX15aQl1U"
+kintaro_iv = "enc:DwxTHVIJWV5UVEZJQ1BeDA=="
+kintaro_sec_cfg = [13, 29, 1, 28, 8, 13, 7, 10, 3, 3]
+jwt_sign_key = "enc:Gl0IZyk+OiM/BAxrEAoWXRwKBjUkEGIAJRk8BDceeDs="
+
+[regions.us]
+backend = "na"
+country = "US"
+locale = "en-US"
+region_code = "us"
+timezone = "America/New_York"
+timezone_offset = "-5"
+
+[regions.ca]
+backend = "na"
+country = "CA"
+locale = "en-CA"
+region_code = "us"
+timezone = "America/Toronto"
+timezone_offset = "-5"
+
+# 日本: backend "jp", knt-region-code "jp", locales ja-JP, en-JP
+[regions.jp]
+backend = "jp"
+country = "JP"
+locale = "ja-JP"
+region_code = "jp"
+timezone = "Asia/Tokyo"
+timezone_offset = "9"
+
+# ประเทศไทย: backend "jp", knt-region-code "jp", locales th-TH, en-TH
+[regions.th]
+backend = "jp"
+country = "TH"
+locale = "th-TH"
+region_code = "jp"
+timezone = "Asia/Bangkok"
+timezone_offset = "7"
+
+# Austria: backend "eu", knt-region-code "eu", locales en-AT, de-AT
+[regions.at]
+backend = "eu"
+country = "AT"
+locale = "de-AT"
+region_code = "eu"
+timezone = "Europe/Vienna"
+timezone_offset = "1"
+
+# Belgium: backend "eu", knt-region-code "eu", locales en-BE, fr-BE, de-BE, nl-BE
+[regions.be]
+backend = "eu"
+country = "BE"
+locale = "fr-BE"
+region_code = "eu"
+timezone = "Europe/Brussels"
+timezone_offset = "1"
+
+# Czech: backend "eu", knt-region-code "eu", locales en-CZ, cs-CZ
+[regions.cz]
+backend = "eu"
+country = "CZ"
+locale = "cs-CZ"
+region_code = "eu"
+timezone = "Europe/Prague"
+timezone_offset = "1"
+
+# Denmark: backend "eu", knt-region-code "eu", locales en-DK, da-DK
+[regions.dk]
+backend = "eu"
+country = "DK"
+locale = "da-DK"
+region_code = "eu"
+timezone = "Europe/Copenhagen"
+timezone_offset = "1"
+
+# Finland: backend "eu", knt-region-code "eu", locales en-FI, fi-FI
+[regions.fi]
+backend = "eu"
+country = "FI"
+locale = "fi-FI"
+region_code = "eu"
+timezone = "Europe/Helsinki"
+timezone_offset = "2"
+
+# France: backend "eu", knt-region-code "eu", locales en-FR, fr-FR
+[regions.fr]
+backend = "eu"
+country = "FR"
+locale = "fr-FR"
+region_code = "eu"
+timezone = "Europe/Paris"
+timezone_offset = "1"
+
+# Germany: backend "eu", knt-region-code "eu", locales en-DE, de-DE
+[regions.de]
+backend = "eu"
+country = "DE"
+locale = "de-DE"
+region_code = "eu"
+timezone = "Europe/Berlin"
+timezone_offset = "1"
+
+# Hungary: backend "eu", knt-region-code "eu", locales en-HU, hu-HU
+[regions.hu]
+backend = "eu"
+country = "HU"
+locale = "hu-HU"
+region_code = "eu"
+timezone = "Europe/Budapest"
+timezone_offset = "1"
+
+# Iceland: backend "eu", knt-region-code "eu", locales en-IS, is-IS
+[regions.is]
+backend = "eu"
+country = "IS"
+locale = "is-IS"
+region_code = "eu"
+timezone = "Atlantic/Reykjavik"
+timezone_offset = "0"
+
+# Italy: backend "eu", knt-region-code "eu", locales en-IT, it-IT
+[regions.it]
+backend = "eu"
+country = "IT"
+locale = "it-IT"
+region_code = "eu"
+timezone = "Europe/Rome"
+timezone_offset = "1"
+
+# Netherlands: backend "eu", knt-region-code "eu", locales en-NL, nl-NL
+[regions.nl]
+backend = "eu"
+country = "NL"
+locale = "nl-NL"
+region_code = "eu"
+timezone = "Europe/Amsterdam"
+timezone_offset = "1"
+
+# Norway: backend "eu", knt-region-code "eu", locales en-NO, nb-NO
+[regions.no]
+backend = "eu"
+country = "NO"
+locale = "nb-NO"
+region_code = "eu"
+timezone = "Europe/Oslo"
+timezone_offset = "1"
+
+# Poland: backend "eu", knt-region-code "eu", locales en-PL, pl-PL
+[regions.pl]
+backend = "eu"
+country = "PL"
+locale = "pl-PL"
+region_code = "eu"
+timezone = "Europe/Warsaw"
+timezone_offset = "1"
+
+# Portugal: backend "eu", knt-region-code "eu", locales en-PT, pt-PT
+[regions.pt]
+backend = "eu"
+country = "PT"
+locale = "pt-PT"
+region_code = "eu"
+timezone = "Europe/Lisbon"
+timezone_offset = "0"
+
+# Romania: backend "eu", knt-region-code "eu", locales en-RO, ro-RO
+[regions.ro]
+backend = "eu"
+country = "RO"
+locale = "ro-RO"
+region_code = "eu"
+timezone = "Europe/Bucharest"
+timezone_offset = "2"
+
+# Slovakia: backend "eu", knt-region-code "eu", locales en-SK, sk-SK
+[regions.sk]
+backend = "eu"
+country = "SK"
+locale = "sk-SK"
+region_code = "eu"
+timezone = "Europe/Bratislava"
+timezone_offset = "1"
+
+# Slovenia: backend "eu", knt-region-code "eu", locales en-SI, sl-SI
+[regions.si]
+backend = "eu"
+country = "SI"
+locale = "sl-SI"
+region_code = "eu"
+timezone = "Europe/Ljubljana"
+timezone_offset = "1"
+
+# Spain: backend "eu", knt-region-code "eu", locales en-ES, es-ES
+[regions.es]
+backend = "eu"
+country = "ES"
+locale = "es-ES"
+region_code = "eu"
+timezone = "Europe/Madrid"
+timezone_offset = "1"
+
+# Sweden: backend "eu", knt-region-code "eu", locales en-SE, sv-SE
+[regions.se]
+backend = "eu"
+country = "SE"
+locale = "sv-SE"
+region_code = "eu"
+timezone = "Europe/Stockholm"
+timezone_offset = "1"
+
+# Switzerland: backend "eu", knt-region-code "eu", locales en-CH, fr-CH, de-CH, it-CH
+[regions.ch]
+backend = "eu"
+country = "CH"
+locale = "de-CH"
+region_code = "eu"
+timezone = "Europe/Zurich"
+timezone_offset = "1"
+
+# Australia: backend "jp", knt-region-code "au", locales en-AU
+[regions.au]
+backend = "jp"
+country = "AU"
+locale = "en-AU"
+region_code = "au"
+timezone = "Australia/Sydney"
+timezone_offset = "10"

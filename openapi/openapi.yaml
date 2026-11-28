@@ -1,0 +1,3706 @@
+openapi: 3.2.0
+info:
+  title: Mitsubishi Motors Connected Services API (Kintaro & IDM)
+  version: 3.2.0
+  description: |
+    Unofficial OpenAPI specification for the Mitsubishi Motors Connected Services backend
+    (StationDM **IDM** authentication + **Kintaro** vehicle & remote control API).
+
+    ### Scope and intent
+    This is a personal, non-commercial open-source project. Its only goal is to let the author
+    monitor and control his own Mitsubishi vehicle (gas or PHEV) from his own Home Assistant
+    smart home: the same everyday actions the official app already gives the car's owner. It
+    documents only the endpoints that use case needs, so account, payment, dealer, fleet,
+    pairing, notifications and similar endpoints are intentionally left out.
+
+    It is not affiliated with or endorsed by Mitsubishi Motors and does not resell or re-expose
+    their services. It is built to put no more load on the backend than the official app already
+    does: it reuses one saved session instead of logging in repeatedly, reads server-cached
+    telemetry on a conservative interval, and never wakes the vehicle on its own. If anything
+    here is unwelcome, an issue or a message to the repository owner is the quickest way to sort
+    it out.
+
+    ### Application-Level Transport Layer
+    This specification documents the **logical decrypted JSON payloads** exchanged with both services:
+
+    1. **IDM (Authentication)**
+       - All request and response bodies are wrapped in `{"payload": "<base64>"}` encrypted with **AES-256-ECB + PKCS7**.
+       - Signed via `X-Signature = md5(clientId + nonce + timestamp)` (lowercase hex) with `User-Agent: okhttp/4.12.0`.
+       - `/api/v1/init` requires an `app-device-token` header (HS256 JWT).
+
+    2. **Kintaro (Vehicle & Remote Commands)**
+       - Handshake `POST /service/checkVersion` returns ephemeral session keys: `encKey` (16 bytes) and `signKey` (24 bytes).
+       - `GET` requests with query parameters: URL-encoded query string is encrypted with **AES-128-CBC** and sent as `?params=<url_encoded(b64)>`.
+       - `POST`/`PUT` requests with body: JSON string is encrypted with **AES-128-CBC** and sent as `text/plain; charset=utf-8`.
+       - Signed via `knt-sign = SHA256(encData + ts + ts[2:] + ts[2:] + signKey).upper()`.
+       - Authenticated via `knt-access-token: <IDM accessToken>` (raw token, no `Bearer ` prefix).
+       - Responses are wrapped in `{"state": "S"|"F", "payload": "<aes_cbc_b64>", "errorCode": ...}`.
+       - Auto-recoverable error codes: `600001` (expired session key → re-run `checkVersion`), `600002`/`600004` (expired `accessToken` → call `refreshToken`).
+
+    3. **PIN Challenge Protocol (`pinHash`)**
+       - Generate `clientNonce = base64(random_32_bytes)`.
+       - Call `POST /remote/generateServerNonce/v1` to obtain `serverNonce`.
+       - Compute `key = b64decode(clientNonce) + ":" + b64decode(serverNonce)`.
+       - Compute `digest = HMAC-SHA256(key, pin_utf8)` (32 bytes), XOR the two 16-byte halves, and Base64-encode the 16-byte result → `pinHash`.
+
+    ### Conventions of this document
+    - Every operation describes the **decrypted logical payload**. The Kintaro envelope (`KintaroEnvelope`) and IDM envelope (`IdmEnvelope`) are documented once in `components`.
+    - Request `required` lists mark the fields the server expects, plus `vin` wherever a vehicle is targeted. Response schemas list no required fields except the handshake, nonce and IDM key fields: clients should tolerate missing fields.
+    - Enums are set on request fields and query parameters. Response fields list known values in their description only, so unknown server values do not break generated clients.
+    - `x-restrictions` flags PHEV/EV-only, primary-account-only and subscription-gated endpoints, `x-error-codes` lists endpoint-specific error codes.
+
+    ### Errors
+    Kintaro answers HTTP 200 with `state: "F"` and an `errorCode` (see `ErrorCode` and `components/responses/KintaroFailure`). IDM answers with `code != "200"` in the decrypted body (see `IdmResultCode`).
+
+    ### Regions and backends
+    Three production backends serve the official app. The country chosen when signing up selects the backend; Australia uses the Japan / Asia-Pacific backend with its own `knt-region-code`. No public staging or test host is known.
+
+    | Backend (`{region}`) | Kintaro / IDM hosts | Countries (`knt-region-code`) |
+    |---|---|---|
+    | `goa-na` | `kintaro.prod.goa-na`, `idm.prod.goa-na` | US, CA (`us`) |
+    | `goa-eu` | `kintaro.prod.goa-eu`, `idm.prod.goa-eu` | AT, BE, CH, CZ, DE, DK, ES, FI, FR, HU, IS, IT, NL, NO, PL, PT, RO, SE, SI, SK (`eu`) |
+    | `goa` | `kintaro.prod.goa`, `idm.prod.goa` | JP, TH (`jp`), AU (`au`) |
+
+    Each backend has its own IDM client id/secret, Kintaro `app_code`, security key settings (`sec_cfg` and IV) and, for `goa`, its own JWT signing key. The endpoint list is identical across backends. Regional differences are per-country settings:
+    - residence check on `getProfile` (`checkResidenceFlag`, code `956003`): US, CA, JP, TH, AU, not Europe;
+    - licence plate editing (`updateVehicle.licensePlateNumber`, `supportLicensePlateNoFlag`): JP, TH, AU;
+    - kana name and prefecture fields of `UserEntity` (`firstNameKana`, `lastNameKana`, `addressPref`): Japan;
+    - tax rate and payment method change (`supportChangePaymentMethodFlag`) only configured for JP, TH, AU.
+servers:
+- name: Kintaro
+  url: https://kintaro.prod.{region}.mitsubishi-motors.com/prod
+  description: Kintaro vehicle and remote API, region selected by variable
+  variables:
+    region:
+      default: goa-na
+      enum:
+      - goa-na
+      - goa-eu
+      - goa
+      description: 'Backend region: `goa-na` North America (US, CA), `goa-eu` Europe, `goa` Japan / Asia-Pacific (JP, TH, AU).'
+- name: Kintaro NA
+  url: https://kintaro.prod.goa-na.mitsubishi-motors.com/prod
+  description: Kintaro North America (US, CA)
+- name: Kintaro EU
+  url: https://kintaro.prod.goa-eu.mitsubishi-motors.com/prod
+  description: Kintaro Europe (20 countries)
+- name: Kintaro JP
+  url: https://kintaro.prod.goa.mitsubishi-motors.com/prod
+  description: Kintaro Japan / Asia-Pacific (JP, TH, AU)
+tags:
+- name: auth
+  summary: Authentication (IDM)
+  description: OAuth/IDM authentication (RSA init, login, token refresh)
+  kind: nav
+- name: session
+  summary: Kintaro session
+  description: Kintaro encrypted session handshake (`checkVersion`)
+  kind: nav
+- name: vehicle
+  summary: Vehicle
+  description: Vehicle list, wake-up, OTA firmware, privacy mode, and alerts
+  kind: nav
+- name: alerts
+  summary: Alerts
+  description: Curfew, geofence and speed alerts (parental controls)
+  parent: vehicle
+  kind: nav
+- name: status
+  summary: Status & telemetry
+  description: VSR telemetry (odometer, doors, range, tires), engine/HVAC state, mileage history
+  kind: nav
+- name: remote
+  summary: Remote commands
+  description: Remote commands (engine start/stop, door lock/unlock, horn, lights, GPS, POI)
+  kind: nav
+- name: polling
+  summary: PIN nonce & polling
+  description: Server PIN nonce challenge, available services, and async command status polling
+  parent: remote
+  kind: nav
+- name: phev
+  summary: PHEV / EV
+  description: Endpoints specific to PHEV/EV models (charging, SOC target, electric climate)
+  kind: nav
+- name: charging
+  summary: Charging
+  description: Charging control, charge status, SOC limits, charging cost and history
+  parent: phev
+  kind: nav
+- name: schedules
+  summary: Schedules
+  description: Charge, climate and combined charge/climate schedules
+  parent: phev
+  kind: nav
+security:
+- KntAccessToken: []
+paths:
+  /api/v1/init:
+    servers:
+    - name: IDM
+      url: https://idm.prod.{region}.mitsubishi-motors.com
+      description: IDM authentication API, region selected by variable
+      variables:
+        region:
+          default: goa-na
+          enum:
+          - goa-na
+          - goa-eu
+          - goa
+          description: 'Backend region: `goa-na` North America (US, CA), `goa-eu` Europe, `goa` Japan / Asia-Pacific (JP, TH, AU).'
+    - name: IDM NA
+      url: https://idm.prod.goa-na.mitsubishi-motors.com
+      description: IDM North America (US, CA)
+    - name: IDM EU
+      url: https://idm.prod.goa-eu.mitsubishi-motors.com
+      description: IDM Europe
+    - name: IDM JP
+      url: https://idm.prod.goa.mitsubishi-motors.com
+      description: IDM Japan / Asia-Pacific (JP, TH, AU)
+    post:
+      operationId: idmInit
+      tags:
+      - auth
+      summary: Initialize IDM session and fetch RSA public key
+      description: |-
+        IDM server endpoint. Requires `app-device-token` header (HS256 JWT).
+        Returns `keyIndex` and `publicKey` (Base64 DER X.509 RSA public key)
+        used to encrypt the password for `/api/v1/login`.
+
+
+        Success is `code == "200"`; `code == "401"` means the access token is invalid (refresh it).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdmInitRequest'
+      responses:
+        '200':
+          description: IDM RSA session key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdmInitResponse'
+  /api/v1/login:
+    servers:
+    - name: IDM
+      url: https://idm.prod.{region}.mitsubishi-motors.com
+      description: IDM authentication API, region selected by variable
+      variables:
+        region:
+          default: goa-na
+          enum:
+          - goa-na
+          - goa-eu
+          - goa
+          description: 'Backend region: `goa-na` North America (US, CA), `goa-eu` Europe, `goa` Japan / Asia-Pacific (JP, TH, AU).'
+    - name: IDM NA
+      url: https://idm.prod.goa-na.mitsubishi-motors.com
+      description: IDM North America (US, CA)
+    - name: IDM EU
+      url: https://idm.prod.goa-eu.mitsubishi-motors.com
+      description: IDM Europe
+    - name: IDM JP
+      url: https://idm.prod.goa.mitsubishi-motors.com
+      description: IDM Japan / Asia-Pacific (JP, TH, AU)
+    post:
+      operationId: idmLogin
+      tags:
+      - auth
+      summary: User login (email + RSA-encrypted password)
+      description: |-
+        IDM server endpoint. Format `password` as `<keyIndex>@<base64(RSA_PKCS1v15(password))>`.
+        Omit `app-device-token` on this endpoint.
+
+
+        Success is `code == "200"`; `code == "401"` means the access token is invalid (refresh it).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdmLoginRequest'
+      responses:
+        '200':
+          description: OAuth/IDM token bundle
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdmTokensResponse'
+  /api/v1/refreshToken:
+    servers:
+    - name: IDM
+      url: https://idm.prod.{region}.mitsubishi-motors.com
+      description: IDM authentication API, region selected by variable
+      variables:
+        region:
+          default: goa-na
+          enum:
+          - goa-na
+          - goa-eu
+          - goa
+          description: 'Backend region: `goa-na` North America (US, CA), `goa-eu` Europe, `goa` Japan / Asia-Pacific (JP, TH, AU).'
+    - name: IDM NA
+      url: https://idm.prod.goa-na.mitsubishi-motors.com
+      description: IDM North America (US, CA)
+    - name: IDM EU
+      url: https://idm.prod.goa-eu.mitsubishi-motors.com
+      description: IDM Europe
+    - name: IDM JP
+      url: https://idm.prod.goa.mitsubishi-motors.com
+      description: IDM Japan / Asia-Pacific (JP, TH, AU)
+    post:
+      operationId: idmRefreshToken
+      tags:
+      - auth
+      summary: Refresh IDM access token
+      description: |-
+        IDM server endpoint. Exchanges `refreshToken` for a fresh `accessToken`.
+
+        Success is `code == "200"`; `code == "401"` means the access token is invalid (refresh it).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdmRefreshTokenRequest'
+      responses:
+        '200':
+          description: Refreshed token bundle
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdmTokensResponse'
+  /api/v1/logout:
+    servers:
+    - name: IDM
+      url: https://idm.prod.{region}.mitsubishi-motors.com
+      description: IDM authentication API, region selected by variable
+      variables:
+        region:
+          default: goa-na
+          enum:
+          - goa-na
+          - goa-eu
+          - goa
+          description: 'Backend region: `goa-na` North America (US, CA), `goa-eu` Europe, `goa` Japan / Asia-Pacific (JP, TH, AU).'
+    - name: IDM NA
+      url: https://idm.prod.goa-na.mitsubishi-motors.com
+      description: IDM North America (US, CA)
+    - name: IDM EU
+      url: https://idm.prod.goa-eu.mitsubishi-motors.com
+      description: IDM Europe
+    - name: IDM JP
+      url: https://idm.prod.goa.mitsubishi-motors.com
+      description: IDM Japan / Asia-Pacific (JP, TH, AU)
+    post:
+      operationId: idmLogout
+      tags:
+      - auth
+      summary: Log out and revoke the current IDM session
+      description: |-
+        IDM server endpoint (`POST`, body encrypted as `{"payload": ...}`). Authenticated with `Authorization: Bearer <accessToken>`.
+
+        Success is `code == "200"`; `code == "401"` means the access token is invalid (refresh it).
+      security:
+      - IdmBearer: []
+      responses:
+        '200':
+          description: Decrypted IDM response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdmBaseResponse'
+  /service/checkVersion:
+    post:
+      operationId: kintaroCheckVersion
+      tags:
+      - session
+      summary: 'Kintaro handshake: obtain ephemeral `encKey` and `signKey`'
+      description: |
+        Empty request body. Signed using the static key derived from `app_code + package_name + kintaro_hash`
+        and accompanied by `knt-app-device-token` (HS256 JWT).
+      security: []
+      responses:
+        '200':
+          description: Ephemeral Kintaro session keys
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckVersionResponse'
+  /remote/generateServerNonce/v1:
+    post:
+      operationId: generateServerNonce
+      tags:
+      - polling
+      - remote
+      summary: Obtain a `serverNonce` for computing `pinHash`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServerNonceRequest'
+      responses:
+        '200':
+          description: Server nonce
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerNonceResponse'
+  /remote/getAvailableService/v1:
+    get:
+      operationId: getAvailableService
+      tags:
+      - polling
+      - remote
+      summary: List active remote services for the vehicle subscription
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      - name: isSecondaryVehicle
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - 'true'
+          - 'false'
+          default: 'false'
+      responses:
+        '200':
+          description: Available services and activation flags
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableServicesResponse'
+  /remote/getBatchRequestStatus/v1:
+    post:
+      operationId: getBatchRequestStatus
+      tags:
+      - polling
+      - remote
+      summary: Poll asynchronous status of one or more remote commands
+      description: |-
+        Poll every `pollingInterval` seconds (default 5 s) while `status == 1`.
+        - `1`: In progress (`IN_PROGRESS`)
+        - `2`: Success (`SUCCESS`)
+        - Other value: Failed (`FAILED`) Response model `MMBatchRequestStatusEntity`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchRequestStatusRequest'
+      responses:
+        '200':
+          description: Command status list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchRequestStatusResponse'
+  /remote/getSOCSetting/v1:
+    get:
+      operationId: getSocSetting
+      tags:
+      - phev
+      - charging
+      summary: Get SOC setting
+      description: PHEV/EV only.
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SOCSettingEntity'
+      x-restrictions:
+      - phev-ev
+  /remote/getVehicleLocation/v1:
+    post:
+      operationId: getVehicleLocation
+      tags:
+      - remote
+      summary: Get vehicle GPS coordinates (Find My Car)
+      description: |-
+        Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PinCommandRequest'
+      responses:
+        '200':
+          description: Vehicle GPS coordinates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VehicleLocationResponse'
+      x-restrictions:
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/lockDoor/v1:
+    post:
+      operationId: lockDoor
+      tags:
+      - remote
+      summary: Lock doors remotely
+      description: |-
+        Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PinCommandRequest'
+      responses:
+        '200':
+          description: Lock command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/setSOCSetting/v1:
+    post:
+      operationId: setSocSetting
+      tags:
+      - phev
+      - charging
+      summary: Set SOC setting
+      description: PHEV/EV only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SOCSettingEntity'
+      responses:
+        '200':
+          description: Command accepted (empty or untyped payload)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericResponse'
+      x-restrictions:
+      - phev-ev
+  /remote/startCharge/v1:
+    post:
+      operationId: startCharge
+      tags:
+      - phev
+      - remote
+      - charging
+      summary: Start charging (PHEV/EV only)
+      description: |-
+        PHEV/EV only. Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PinCommandRequest'
+      responses:
+        '200':
+          description: Command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - phev-ev
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/startClimate/v1:
+    post:
+      operationId: startClimate
+      tags:
+      - phev
+      - remote
+      summary: Start electric climate control (PHEV/EV only)
+      description: |-
+        PHEV/EV only. Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartEngineRequest'
+      responses:
+        '200':
+          description: Command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - phev-ev
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/startEngine/v1:
+    post:
+      operationId: startEngine
+      tags:
+      - remote
+      summary: Remote engine start (with HVAC settings)
+      description: |-
+        Requires a valid `pinHash`.
+        WARNING: Never run remote engine start in a closed garage (CO poisoning hazard).
+
+        Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartEngineRequest'
+      responses:
+        '200':
+          description: Start command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/startHorn/v1:
+    post:
+      operationId: startHorn
+      tags:
+      - remote
+      summary: Sound the horn remotely
+      description: |-
+        Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PinCommandRequest'
+      responses:
+        '200':
+          description: Horn command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/startLight/v1:
+    post:
+      operationId: startLight
+      tags:
+      - remote
+      summary: Flash headlights remotely
+      description: |-
+        Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PinCommandRequest'
+      responses:
+        '200':
+          description: Lights command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/stopCharge/v1:
+    post:
+      operationId: stopCharge
+      tags:
+      - phev
+      - remote
+      - charging
+      summary: Stop charging (PHEV/EV only)
+      description: |-
+        PHEV/EV only. Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PinCommandRequest'
+      responses:
+        '200':
+          description: Command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - phev-ev
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/stopClimate/v1:
+    post:
+      operationId: stopClimate
+      tags:
+      - phev
+      - remote
+      summary: Stop electric climate control (PHEV/EV only)
+      description: |-
+        PHEV/EV only. Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StopEngineRequest'
+      responses:
+        '200':
+          description: Command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - phev-ev
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/stopEngine/v1:
+    post:
+      operationId: stopEngine
+      tags:
+      - remote
+      summary: Stop remote-started engine
+      description: |-
+        Does not require a PIN (`pinHash` optional).
+
+        Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StopEngineRequest'
+      responses:
+        '200':
+          description: Stop command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /remote/unlockDoor/v1:
+    post:
+      operationId: unlockDoor
+      tags:
+      - remote
+      summary: Unlock doors remotely (requires PIN)
+      description: |-
+        Requires an active connected-services subscription; check `getAvailableService`.
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PinCommandRequest'
+      responses:
+        '200':
+          description: Unlock command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - subscription
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+  /status/getChargeClimateSchedule/v1:
+    get:
+      operationId: getChargeClimateSchedule
+      tags:
+      - schedules
+      summary: Get charge climate schedule
+      description: PHEV/EV only.
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeClimateScheduleEntity'
+      x-restrictions:
+      - phev-ev
+  /status/getChargeDetails/v1:
+    get:
+      operationId: getChargeDetails
+      tags:
+      - phev
+      - charging
+      summary: Get battery and charging status (PHEV/EV only)
+      description: PHEV/EV only.
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      - name: refreshType
+        in: query
+        required: false
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Charging details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeDetailEntity'
+      x-restrictions:
+      - phev-ev
+  /status/getChargeSchedule/v1:
+    get:
+      operationId: getChargeSchedule
+      tags:
+      - schedules
+      summary: Get charge schedule
+      description: PHEV/EV only.
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleEntity'
+      x-restrictions:
+      - phev-ev
+  /status/getClimateDetails/v1:
+    get:
+      operationId: getClimateDetails
+      tags:
+      - phev
+      summary: Get electric climate (A/C) state and HVAC settings (PHEV/EV)
+      description: PHEV/EV only.
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineClimateDetails'
+      x-restrictions:
+      - phev-ev
+  /status/getClimateSchedule/v1:
+    get:
+      operationId: getClimateSchedule
+      tags:
+      - schedules
+      summary: Get climate schedule
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      - name: supportSeparateTemp
+        in: query
+        required: true
+        schema:
+          type: boolean
+        description: Client supports separate front temperatures.
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleEntity'
+  /status/getEngineDetails/v1:
+    get:
+      operationId: getEngineDetails
+      tags:
+      - status
+      summary: Get remote engine state and HVAC settings (ICE / non-PHEV)
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: Engine & HVAC details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineClimateDetails'
+  /status/getVSR/v1:
+    get:
+      operationId: getVsr
+      tags:
+      - status
+      summary: Get latest cached Vehicle Status Report (VSR)
+      description: |-
+        Returns the latest server-cached snapshot (~1-2 s, does not wake the vehicle):
+        odometer, fuel range, individual door/hood/trunk states, headlights,
+        brake/oil/TPMS warnings, and ignition status.
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: VSR snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VsrPayload'
+  /status/refreshVSR/v1:
+    post:
+      operationId: refreshVsr
+      tags:
+      - status
+      summary: Request a live VSR telemetry refresh from the vehicle
+      description: |-
+        Wakes the vehicle and requests a fresh VSR upload. Returns a `requestId` to poll
+        via `POST /remote/getBatchRequestStatus/v1`, then re-read `GET /status/getVSR/v1`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshVsrRequest'
+      responses:
+        '200':
+          description: Asynchronous refresh command accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+  /status/setChargeClimateSchedule/v1:
+    post:
+      operationId: setChargeClimateSchedule
+      tags:
+      - schedules
+      summary: Set charge climate schedule
+      description: PHEV/EV only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChargeClimateScheduleUpdateRequest'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - phev-ev
+  /status/setChargeSchedule/v1:
+    post:
+      operationId: setChargeSchedule
+      tags:
+      - schedules
+      summary: Set charge schedule
+      description: PHEV/EV only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleEntity'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - phev-ev
+  /status/setClimateSchedule/v1:
+    post:
+      operationId: setClimateSchedule
+      tags:
+      - schedules
+      summary: Set climate schedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleEntity'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+  /vehicle/createCurfewAlert/v1:
+    post:
+      operationId: createCurfewAlert
+      tags:
+      - alerts
+      summary: Create curfew alert
+      description: Primary account (vehicle owner) only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCurfewAlertRequest'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - primary-only
+  /vehicle/createGeofenceAlert/v1:
+    post:
+      operationId: createGeofenceAlert
+      tags:
+      - alerts
+      summary: Create geofence alert
+      description: Primary account (vehicle owner) only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateGeofenceAlertRequest'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - primary-only
+  /vehicle/createSpeedAlert/v1:
+    post:
+      operationId: createSpeedAlert
+      tags:
+      - alerts
+      summary: Create speed alert
+      description: Primary account (vehicle owner) only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSpeedAlertRequest'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertCommandEntity'
+      x-restrictions:
+      - primary-only
+  /vehicle/deleteCurfewAlert/v1:
+    post:
+      operationId: deleteCurfewAlert
+      tags:
+      - alerts
+      summary: Delete curfew alert
+      description: Primary account (vehicle owner) only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteCurfewAlertRequest'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - primary-only
+  /vehicle/deleteGeofenceAlert/v1:
+    post:
+      operationId: deleteGeofenceAlert
+      tags:
+      - alerts
+      summary: Delete geofence alert
+      description: Primary account (vehicle owner) only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGeofenceAlertRequest'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - primary-only
+  /vehicle/getCurfewAlert/v1:
+    get:
+      operationId: getCurfewAlert
+      tags:
+      - vehicle
+      - alerts
+      summary: Get configured curfew alerts
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: Curfew alert configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurfewAlertResponse'
+  /vehicle/getGeofenceAlert/v1:
+    get:
+      operationId: getGeofenceAlert
+      tags:
+      - vehicle
+      - alerts
+      summary: Get configured geofence alerts
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: Geofence alert configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeofenceAlertResponse'
+  /vehicle/getSpeedAlert/v1:
+    get:
+      operationId: getSpeedAlert
+      tags:
+      - vehicle
+      - alerts
+      summary: Get configured speed alerts
+      parameters:
+      - $ref: '#/components/parameters/VinQuery'
+      - $ref: '#/components/parameters/InternalVinQuery'
+      responses:
+        '200':
+          description: Speed alert configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpeedAlertResponse'
+  /vehicle/getVehicleList/v1:
+    get:
+      operationId: getVehicleList
+      tags:
+      - vehicle
+      summary: List vehicles associated with the account
+      responses:
+        '200':
+          description: List of vehicles
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VehicleListResponse'
+  /vehicle/updateCurfewAlert/v1:
+    post:
+      operationId: updateCurfewAlert
+      tags:
+      - alerts
+      summary: Update curfew alert
+      description: Primary account (vehicle owner) only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCurfewAlertRequest'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - primary-only
+  /vehicle/updateGeofenceAlert/v1:
+    post:
+      operationId: updateGeofenceAlert
+      tags:
+      - alerts
+      summary: Update geofence alert
+      description: Primary account (vehicle owner) only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGeofenceAlertRequest'
+      responses:
+        '200':
+          description: Decrypted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteCommandResponse'
+      x-restrictions:
+      - primary-only
+  /vehicle/verifyPIN/v1:
+    post:
+      operationId: verifyPin
+      tags:
+      - vehicle
+      summary: Verify the 4-digit security PIN
+      description: |2-
+
+
+        Known error codes: `600006`, `600007`, `956000` (see `ErrorCode`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyPinRequest'
+      responses:
+        '200':
+          description: PIN verification result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyPinResponse'
+      x-error-codes:
+      - '600006'
+      - '600007'
+      - '956000'
+components:
+  securitySchemes:
+    KntAccessToken:
+      type: apiKey
+      in: header
+      name: knt-access-token
+      description: Raw IDM access token (no `Bearer ` prefix)
+    IdmBearer:
+      type: http
+      scheme: bearer
+      description: 'IDM access token as `Authorization: Bearer <accessToken>`.'
+  parameters:
+    VinQuery:
+      name: vin
+      in: query
+      required: true
+      schema:
+        type: string
+        example: JA4XXXXXXXXXXXXXX
+      description: 17-character Vehicle Identification Number (VIN)
+    InternalVinQuery:
+      name: internalVin
+      in: query
+      required: false
+      schema:
+        type: string
+      description: Optional internal VIN (omitted when not provided by vehicle list)
+  schemas:
+    AlertCommandEntity:
+      type: object
+      properties:
+        commandId:
+          type:
+          - string
+          - 'null'
+        curfewId:
+          type:
+          - string
+          - 'null'
+        geofenceId:
+          type:
+          - string
+          - 'null'
+    AvailableServiceItem:
+      type: object
+      properties:
+        availableServiceId:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        hvacSettings:
+          $ref: '#/components/schemas/HVACSettingsEntity'
+        isActive:
+          type:
+          - boolean
+          - 'null'
+          default: true
+        isInitial:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        isUIVisible:
+          type:
+          - boolean
+          - 'null'
+          default: true
+        modifiedAt:
+          type:
+          - string
+          - 'null'
+        version:
+          type:
+          - string
+          - 'null'
+    AvailableServicesResponse:
+      type: object
+      properties:
+        availableServiceForceCheck:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        services:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailableServiceItem'
+    BatchRequestStatusRequest:
+      type: object
+      required:
+      - requestIdList
+      properties:
+        requestIdList:
+          type: array
+          items:
+            $ref: '#/components/schemas/RequestIdItem'
+    BatchRequestStatusResponse:
+      type: object
+      description: App model `MMBatchRequestStatusEntity`.
+      properties:
+        requestStatusList:
+          type: array
+          items:
+            $ref: '#/components/schemas/RequestStatusItem'
+    ChargeClimateProgramEntity:
+      type: object
+      properties:
+        programActivationFriday:
+          type:
+          - boolean
+          - 'null'
+        programActivationMonday:
+          type:
+          - boolean
+          - 'null'
+        programActivationSaturday:
+          type:
+          - boolean
+          - 'null'
+        programActivationStatus:
+          type:
+          - boolean
+          - 'null'
+        programActivationSunday:
+          type:
+          - boolean
+          - 'null'
+        programActivationThursday:
+          type:
+          - boolean
+          - 'null'
+        programActivationTuesday:
+          type:
+          - boolean
+          - 'null'
+        programActivationWednesday:
+          type:
+          - boolean
+          - 'null'
+        programDepartureTime:
+          type:
+          - string
+          - 'null'
+        programType:
+          type:
+          - string
+          - 'null'
+    ChargeClimateScheduleEntity:
+      type: object
+      properties:
+        chargeDuration:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        chargeModeRq:
+          type:
+          - string
+          - 'null'
+        chargeTimeStart:
+          type:
+          - string
+          - 'null'
+        delegatedActivated:
+          type:
+          - boolean
+          - 'null'
+        hvacSettings:
+          $ref: '#/components/schemas/HvacSettings'
+        isScheduleWithLocalTime:
+          type: boolean
+          default: false
+        lastSettingsUpdateTimestamp:
+          type:
+          - string
+          - 'null'
+        preconditioningTemperature:
+          type:
+          - string
+          - 'null'
+        programs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChargeClimateProgramEntity'
+        temperatureUnit:
+          type:
+          - string
+          - 'null'
+          description: Temperature unit, `C` or `F`.
+          example: C
+    ChargeClimateScheduleUpdateRequest:
+      type: object
+      properties:
+        chargeDuration:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        chargeModeRq:
+          type:
+          - string
+          - 'null'
+        chargeTimeStart:
+          type:
+          - string
+          - 'null'
+        delegatedActivated:
+          type:
+          - boolean
+          - 'null'
+        hvacSettings:
+          $ref: '#/components/schemas/HvacSettings'
+        includeChargeSchedule:
+          type:
+          - boolean
+          - 'null'
+        includeClimateSchedule:
+          type:
+          - boolean
+          - 'null'
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        lastSettingsUpdateTimestamp:
+          type:
+          - string
+          - 'null'
+        preconditioningTemperature:
+          type:
+          - string
+          - 'null'
+        programs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChargeClimateProgramEntity'
+        scheduleAction:
+          type: integer
+          format: int32
+          enum:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          description: '0 Create, 1 EditDetails, 2 EditToggle, 3 DeleteSwipe, 4 DeleteDetails, 5 SettingsCharge, 6 SettingsClimate.'
+        supportPollingFlag:
+          type:
+          - boolean
+          - 'null'
+          description: When `true`, the server returns a `requestId` to poll with `getBatchRequestStatus`.
+        temperatureUnit:
+          type:
+          - string
+          - 'null'
+          description: Temperature unit, `C` or `F`.
+          example: C
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    ChargeDetailEntity:
+      type: object
+      properties:
+        hvBatteryLife:
+          type:
+          - string
+          - 'null'
+        hvChargingReady:
+          type:
+          - string
+          - 'null'
+        hvTimeToFullCharge:
+          type:
+          - string
+          - 'null'
+        isDisableStart:
+          type: boolean
+          default: false
+        isPluggedIn:
+          type: boolean
+          default: false
+        isRealCharging:
+          type: boolean
+          default: false
+        pollingInterval:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        timestamp:
+          type:
+          - string
+          - 'null'
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    CheckVersionResponse:
+      type: object
+      required:
+      - encKey
+      - signKey
+      properties:
+        encKey:
+          type: string
+        signKey:
+          type: string
+    ConditioningDefinitionEntity:
+      type: object
+      properties:
+        conditioningAction:
+          type:
+          - string
+          - 'null'
+        conditioningId:
+          type:
+          - string
+          - 'null'
+        conditioningName:
+          type:
+          - string
+          - 'null'
+        conditioningStatus:
+          type:
+          - string
+          - 'null'
+        frontTemperature:
+          type:
+          - string
+          - 'null'
+        hvacSettings:
+          $ref: '#/components/schemas/HvacSettings'
+        isAddManually:
+          type: boolean
+        schedule:
+          $ref: '#/components/schemas/ScheduleDetailEntity'
+        temperatureUnit:
+          type:
+          - string
+          - 'null'
+          description: Temperature unit, `C` or `F`.
+          example: C
+    CreateCurfewAlertRequest:
+      type: object
+      required:
+      - curfewId
+      - duration
+      - isScheduleWithLocalTime
+      - startDateTime
+      properties:
+        curfewId:
+          type: string
+        curfewName:
+          type:
+          - string
+          - 'null'
+        days:
+          type: array
+          items:
+            type: string
+        duration:
+          type: number
+          format: double
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        isScheduleWithLocalTime:
+          type: boolean
+        startDateTime:
+          type: string
+        supportPollingFlag:
+          type:
+          - boolean
+          - 'null'
+          description: When `true`, the server returns a `requestId` to poll with `getBatchRequestStatus`.
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    CreateGeofenceAlertRequest:
+      type: object
+      required:
+      - geofenceId
+      - geofenceSpatialDetails
+      properties:
+        geofenceId:
+          type: string
+        geofenceName:
+          type:
+          - string
+          - 'null'
+        geofenceSpatialDetails:
+          $ref: '#/components/schemas/GeofenceSpatialDetailsRequestEntity'
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        supportPollingFlag:
+          type:
+          - boolean
+          - 'null'
+          description: When `true`, the server returns a `requestId` to poll with `getBatchRequestStatus`.
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    CreateSpeedAlertRequest:
+      type: object
+      required:
+      - speed
+      - speedStatus
+      - speedUnit
+      properties:
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        speed:
+          type: integer
+          format: int32
+        speedStatus:
+          type: integer
+          format: int32
+          enum:
+          - 0
+          - 1
+          description: 0 disabled, 1 enabled.
+        speedUnit:
+          type: string
+          enum:
+          - KMH
+          - MPH
+          example: KMH
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    CurfewAlertItem:
+      type: object
+      properties:
+        curfewId:
+          type:
+          - string
+          - 'null'
+        curfewName:
+          type:
+          - string
+          - 'null'
+        curfewStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        days:
+          type: array
+          items:
+            type: string
+        direction:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        duration:
+          type:
+          - number
+          - 'null'
+          format: double
+        isDeleteCheck:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        isScheduleWithLocalTime:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        startDateTime:
+          type:
+          - string
+          - 'null'
+    CurfewAlertResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CurfewAlertItem'
+        supportStartTimeWithOffset:
+          type:
+          - boolean
+          - 'null'
+        timestamp:
+          type:
+          - string
+          - 'null'
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    CVehicleBrandsCommercialEntity:
+      type: object
+      properties:
+        brandCode:
+          type:
+          - string
+          - 'null'
+        brandName:
+          type:
+          - string
+          - 'null'
+        masterBrandName:
+          type:
+          - string
+          - 'null'
+    DeleteCurfewAlertRequest:
+      type: object
+      required:
+      - curfewId
+      - days
+      - duration
+      - startDateTime
+      properties:
+        curfewId:
+          type: string
+        curfewName:
+          type:
+          - string
+          - 'null'
+        days:
+          type: array
+          items:
+            type: string
+        duration:
+          type: number
+          format: double
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        startDateTime:
+          type: string
+        supportPollingFlag:
+          type:
+          - boolean
+          - 'null'
+          description: When `true`, the server returns a `requestId` to poll with `getBatchRequestStatus`.
+        type:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    EngineClimateDetails:
+      type: object
+      properties:
+        action:
+          type:
+          - string
+          - 'null'
+        hvacSettings:
+          $ref: '#/components/schemas/HvacSettings'
+        isACOn:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        isEngineOn:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        targetTemperature:
+          type:
+          - number
+          - 'null'
+          description: Target cabin temperature serialized as a decimal string (one decimal).
+          example: '21.0'
+          format: double
+        temperatureUnit:
+          type:
+          - string
+          - 'null'
+          description: Temperature unit, `C` or `F`.
+          example: C
+        timestamp:
+          type:
+          - string
+          - 'null'
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    GenericResponse:
+      type: object
+      additionalProperties: true
+    GeofenceAlertData:
+      type: object
+      properties:
+        defaultRad:
+          type:
+          - number
+          - 'null'
+          format: double
+        geofenceConf:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenericResponse'
+        maxRad:
+          type:
+          - number
+          - 'null'
+          format: double
+          default: 20000
+        minRad:
+          type:
+          - number
+          - 'null'
+          format: double
+          default: 1000
+    GeofenceAlertResponse:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/GeofenceAlertData'
+        timestamp:
+          type:
+          - string
+          - 'null'
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    GeofenceSpatialDetailsRequestEntity:
+      type: object
+      required:
+      - lat
+      - lon
+      properties:
+        lat:
+          type: string
+          default: '0'
+        lon:
+          type: string
+          default: '0'
+        rad:
+          type:
+          - string
+          - 'null'
+    HvacSettings:
+      type: object
+      description: Cabin comfort / winter HVAC options (0 = OFF, 1+ = ON / level)
+      properties:
+        fanStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        frontDefrostStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        frontLeftSeatStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        frontRightSeatStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        maxDefrostStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        rearCenterSeatStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        rearDefrostStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        rearLeftSeatStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        rearRightSeatStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        startDateTime:
+          type:
+          - string
+          - 'null'
+        steeringHeaterStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+    HVACSettingsEntity:
+      type: object
+      properties:
+        isDelayCancelUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isFanUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isFrontDefrostUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isFrontLeftSeatCoolerUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isFrontLeftSeatHeaterUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isFrontRightSeatCoolerUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isFrontRightSeatHeaterUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isMaxDefrostUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isRearCenterSeatCoolerUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isRearCenterSeatHeaterUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isRearDefrostUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isRearLeftSeatCoolerUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isRearLeftSeatHeaterUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isRearRightSeatCoolerUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isRearRightSeatHeaterUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isSteeringHeaterUIVisible:
+          type:
+          - boolean
+          - 'null'
+        isTemperatureSettingUIVisible:
+          type:
+          - boolean
+          - 'null'
+    IdmBaseResponse:
+      type: object
+      properties:
+        code:
+          type:
+          - string
+          - 'null'
+        error:
+          type:
+          - string
+          - 'null'
+        error_description:
+          type:
+          - string
+          - 'null'
+        message:
+          type:
+          - string
+          - 'null'
+    IdmInitData:
+      type: object
+      required:
+      - keyIndex
+      - publicKey
+      properties:
+        keyIndex:
+          type: string
+        publicKey:
+          type: string
+    IdmInitRequest:
+      type: object
+      required:
+      - deviceId
+      - clientId
+      properties:
+        clientId:
+          type: string
+          description: IDM client id from the regional configuration.
+          example: example-client-id
+        deviceId:
+          type: string
+          description: Random per-install device UUID.
+          example: 00000000-0000-4000-8000-000000000000
+    IdmInitResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        data:
+          $ref: '#/components/schemas/IdmInitData'
+    IdmLoginRequest:
+      type: object
+      required:
+      - username
+      - password
+      - clientId
+      - deviceId
+      properties:
+        clientId:
+          type: string
+          description: IDM client id from the regional configuration.
+          example: example-client-id
+        deviceId:
+          type: string
+          description: Random per-install device UUID.
+          example: 00000000-0000-4000-8000-000000000000
+        password:
+          type: string
+          description: 'For `/api/v1/login`: `<keyIndex>@<base64(RSA_PKCS1v15(password))>`.'
+          example: 1@BASE64CIPHERTEXT==
+        username:
+          type: string
+          example: owner@example.com
+    IdmRefreshTokenRequest:
+      type: object
+      required:
+      - refreshToken
+      - clientId
+      - clientSecret
+      properties:
+        clientId:
+          type: string
+          description: IDM client id from the regional configuration.
+          example: example-client-id
+        clientSecret:
+          type: string
+          description: IDM client secret from the regional configuration.
+          example: example-client-secret
+        refreshToken:
+          type: string
+          example: eyJhbGciOiJIUzI1NiJ9.example.refresh
+    IdmTokensData:
+      type: object
+      properties:
+        accessToken:
+          type: string
+          example: eyJhbGciOiJIUzI1NiJ9.example.signature
+        address:
+          type:
+          - string
+          - 'null'
+        avatar:
+          type:
+          - string
+          - 'null'
+        birthday:
+          type:
+          - string
+          - 'null'
+        city:
+          type:
+          - string
+          - 'null'
+        client_id:
+          type:
+          - string
+          - 'null'
+          description: IDM client id from the regional configuration.
+          example: example-client-id
+        country:
+          type:
+          - string
+          - 'null'
+        email:
+          type:
+          - string
+          - 'null'
+          example: driver@example.com
+        encrypt_password:
+          type:
+          - string
+          - 'null'
+        expiresIn:
+          type: integer
+          format: int32
+        extraData:
+          type: object
+          additionalProperties: true
+        firstName:
+          type:
+          - string
+          - 'null'
+          example: Alex
+        gender:
+          type:
+          - string
+          - integer
+          - 'null'
+          description: String on login, integer on refresh.
+        id:
+          type:
+          - string
+          - 'null'
+        isEmailVerified:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        isMobileVerified:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        isTemporaryPassword:
+          type:
+          - boolean
+          - 'null'
+          default: false
+        last_login_ip:
+          type:
+          - string
+          - 'null'
+        last_login_time:
+          type:
+          - string
+          - 'null'
+        lastName:
+          type:
+          - string
+          - 'null'
+          example: Doe
+        locale:
+          type:
+          - string
+          - 'null'
+        loginBy:
+          type:
+          - string
+          - 'null'
+        login_count:
+          type:
+          - string
+          - 'null'
+        metaData:
+          type: object
+          additionalProperties: true
+        middleName:
+          type:
+          - string
+          - 'null'
+        mobile:
+          type:
+          - string
+          - 'null'
+          example: 555-0100
+        nickname:
+          type:
+          - string
+          - 'null'
+        openid:
+          type:
+          - string
+          - 'null'
+        org_code:
+          type:
+          - string
+          - 'null'
+        partner1Id:
+          type:
+          - string
+          - 'null'
+        partner2Id:
+          type:
+          - string
+          - 'null'
+        refreshToken:
+          type: string
+          example: eyJhbGciOiJIUzI1NiJ9.example.refresh
+        register_date:
+          type:
+          - string
+          - 'null'
+        register_type:
+          type:
+          - string
+          - 'null'
+        state:
+          type:
+          - string
+          - 'null'
+        street1:
+          type:
+          - string
+          - 'null'
+        street2:
+          type:
+          - string
+          - 'null'
+        street3:
+          type:
+          - string
+          - 'null'
+        tokenType:
+          type: string
+        username:
+          type:
+          - string
+          - 'null'
+          example: owner@example.com
+        zipCode:
+          type:
+          - string
+          - 'null'
+        accountLinkUrl:
+          type:
+          - string
+          - 'null'
+        errorMsg:
+          type:
+          - string
+          - 'null'
+        linkStatus:
+          type:
+          - boolean
+          - 'null'
+    IdmTokensResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        error:
+          type:
+          - string
+          - 'null'
+        error_description:
+          type:
+          - string
+          - 'null'
+        message:
+          type: string
+        data:
+          $ref: '#/components/schemas/IdmTokensData'
+    InternalVinEntity:
+      type: object
+      properties:
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    JellybeanEntity:
+      type: object
+      properties:
+        homeJellybean:
+          type:
+          - string
+          - 'null'
+        vehicleColor:
+          type:
+          - string
+          - 'null'
+        vehicleModel:
+          type:
+          - string
+          - 'null'
+        vehicleYear:
+          type:
+          - string
+          - 'null'
+        vsrBodyJellybean:
+          type:
+          - string
+          - 'null'
+        vsrDoorLeftFrontCloseJellybean:
+          type:
+          - string
+          - 'null'
+        vsrDoorLeftFrontOpenJellybean:
+          type:
+          - string
+          - 'null'
+        vsrDoorLeftRearCloseJellybean:
+          type:
+          - string
+          - 'null'
+        vsrDoorLeftRearOpenJellybean:
+          type:
+          - string
+          - 'null'
+        vsrDoorRightFrontCloseJellybean:
+          type:
+          - string
+          - 'null'
+        vsrDoorRightFrontOpenJellybean:
+          type:
+          - string
+          - 'null'
+        vsrDoorRightRearCloseJellybean:
+          type:
+          - string
+          - 'null'
+        vsrDoorRightRearOpenJellybean:
+          type:
+          - string
+          - 'null'
+        vsrHoodJellybean:
+          type:
+          - string
+          - 'null'
+        vsrTailgateJellybean:
+          type:
+          - string
+          - 'null'
+    MetaDataEntity:
+      type: object
+      properties:
+        fetchLegalConfigFlag:
+          type:
+          - string
+          - 'null'
+        guestModeData:
+          type:
+          - string
+          - 'null'
+        hideParentalControlNameFlag:
+          type:
+          - string
+          - 'null'
+        scanCarAttributes:
+          type:
+          - string
+          - 'null'
+        scanCarBaseUrl:
+          type:
+          - string
+          - 'null'
+        soc:
+          $ref: '#/components/schemas/SOCEntity'
+        supportChargeScheduleLimit:
+          type:
+          - string
+          - 'null'
+        supportChargeScheduleUniqueIdFlag:
+          type:
+          - string
+          - 'null'
+        supportClimateScheduleLimit:
+          type:
+          - string
+          - 'null'
+        supportClimateScheduleUniqueIdFlag:
+          type:
+          - string
+          - 'null'
+        supportCurfewAlertMaximum:
+          type:
+          - string
+          - 'null'
+        supportGeofenceAlertMaximum:
+          type:
+          - string
+          - 'null'
+        supportGuestModeFlag:
+          type:
+          - string
+          - 'null'
+        supportPollingFlag:
+          type:
+          - string
+          - 'null'
+          default: '0'
+          description: When `true`, the server returns a `requestId` to poll with `getBatchRequestStatus`.
+        supportPrivacyModeFlag:
+          type:
+          - string
+          - 'null'
+          default: '0'
+        supportSmartRouteWeatherFlag:
+          type:
+          - string
+          - 'null'
+    PairVehicleOtpConfig:
+      type: object
+      properties:
+        expireSeconds:
+          type:
+          - string
+          - 'null'
+        length:
+          type:
+          - string
+          - 'null'
+        lockSeconds:
+          type:
+          - string
+          - 'null'
+        maxWrongTimes:
+          type:
+          - string
+          - 'null'
+    PinCommandRequest:
+      type: object
+      required:
+      - vin
+      properties:
+        cancelFlag:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: 'For stopEngine/stopClimate: 0 IMMEDIATE_STOP_AC, 1 CANCEL_DELAY.'
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        pinAccessToken:
+          type:
+          - string
+          - 'null'
+          description: Short-lived PIN access token obtained through biometrics (`enableBiometricsForRemote` / `refreshBiometricsTokenForRemote`). Alternative to `pinHash`.
+        pinHash:
+          type:
+          - string
+          - 'null'
+          description: PIN challenge hash (see PIN Challenge Protocol in the API description).
+          example: q83vEjRWeJA0Ehcm9kZkZw==
+        vin:
+          type: string
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    RefreshVsrRequest:
+      type: object
+      required:
+      - vin
+      - refreshType
+      properties:
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        refreshType:
+          type: integer
+          default: 1
+          description: 'Refresh trigger: 0 HomeEnter, 1 HomePullDown, 2 Push, 3 StatusEnter, 4 StatusPullDown, 8 AwakeFromBackground.'
+          example: 1
+          format: int32
+        vin:
+          type: string
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    RemoteCommandResponse:
+      type: object
+      properties:
+        conditioningDefinition:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConditioningDefinitionEntity'
+        duration:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        isValidPIN:
+          type:
+          - boolean
+          - 'null'
+          default: true
+        keepForCurrentStep:
+          type: boolean
+          default: false
+        keepForNextStep:
+          type: boolean
+          default: false
+        pollingInterval:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          default: 5
+        requestId:
+          type:
+          - string
+          - 'null'
+          description: Asynchronous command id, poll it with `getBatchRequestStatus`.
+          example: REQ-00000000-0000-0000-0000-000000000000
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    RequestIdItem:
+      type: object
+      required:
+      - requestId
+      properties:
+        requestId:
+          type: string
+          description: Asynchronous command id, poll it with `getBatchRequestStatus`.
+          example: REQ-00000000-0000-0000-0000-000000000000
+    RequestStatusItem:
+      type: object
+      properties:
+        requestId:
+          type: string
+          description: Asynchronous command id, poll it with `getBatchRequestStatus`.
+          example: REQ-00000000-0000-0000-0000-000000000000
+        status:
+          type: integer
+          description: 1 in progress, 2 success, any other value failed.
+          format: int32
+          default: 0
+    ScheduleDetailEntity:
+      type: object
+      properties:
+        dayInterval:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        endDate:
+          type:
+          - string
+          - 'null'
+        endTimeOfDay:
+          type:
+          - string
+          - 'null'
+        everyFriday:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        everyMonday:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        everySaturday:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        everySunday:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        everyThursday:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        everyTuesday:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        everyWednesday:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        isScheduleWithLocalTime:
+          type: boolean
+        serviceScheduleType:
+          type:
+          - string
+          - 'null'
+        startDate:
+          type:
+          - string
+          - 'null'
+        startTimeOfDay:
+          type:
+          - string
+          - 'null'
+    ScheduleEntity:
+      type: object
+      properties:
+        action:
+          type:
+          - string
+          - 'null'
+        conditioningDefinition:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConditioningDefinitionEntity'
+        frontTemperature:
+          type:
+          - string
+          - 'null'
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        isClimateSchedule:
+          type:
+          - boolean
+          - 'null'
+        supportChargeScheduleUniqueIdFlag:
+          type:
+          - string
+          - 'null'
+        supportClimateScheduleUniqueIdFlag:
+          type:
+          - string
+          - 'null'
+        supportPollingFlag:
+          type:
+          - boolean
+          - 'null'
+          description: When `true`, the server returns a `requestId` to poll with `getBatchRequestStatus`.
+        temperatureUnit:
+          type:
+          - string
+          - 'null'
+          description: Temperature unit, `C` or `F`.
+          example: C
+        timestamp:
+          type:
+          - number
+          - 'null'
+          format: double
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    ServerNonceRequest:
+      type: object
+      required:
+      - vin
+      - clientNonce
+      properties:
+        clientNonce:
+          type: string
+          description: base64(random 32 bytes) generated by the client.
+          example: 3q2+7wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        vin:
+          type: string
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    ServerNonceResponse:
+      type: object
+      required:
+      - serverNonce
+      properties:
+        serverNonce:
+          type: string
+    SOCEntity:
+      type: object
+      properties:
+        max:
+          type: string
+          default: '100'
+        min:
+          type: string
+          default: '60'
+        minYear:
+          type:
+          - string
+          - 'null'
+        moveInterval:
+          type: string
+          default: '0'
+        uiInterval:
+          type: string
+          default: '10'
+    SOCSettingEntity:
+      type: object
+      properties:
+        chargingLimitThreshold:
+          type:
+          - string
+          - 'null'
+        chargingNotificationThreshold:
+          type:
+          - string
+          - 'null'
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    SpeedAlertResponse:
+      type: object
+      properties:
+        speed:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        speedStatus:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        speedUnit:
+          type:
+          - string
+          - 'null'
+        timestamp:
+          type:
+          - string
+          - 'null'
+    StartEngineRequest:
+      type: object
+      required:
+      - vin
+      - pinHash
+      - targetTemperature
+      - temperatureUnit
+      properties:
+        action:
+          type:
+          - string
+          - 'null'
+        hvacSettings:
+          $ref: '#/components/schemas/HvacSettings'
+          description: Optional seat, steering and defrost options.
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        pinAccessToken:
+          type:
+          - string
+          - 'null'
+          description: Short-lived PIN access token obtained through biometrics (`enableBiometricsForRemote` / `refreshBiometricsTokenForRemote`). Alternative to `pinHash`.
+        pinHash:
+          type: string
+          description: PIN challenge hash (see PIN Challenge Protocol in the API description).
+          example: q83vEjRWeJA0Ehcm9kZkZw==
+        startFlag:
+          type:
+          - integer
+          - 'null'
+          default: 0
+          description: '0 IMMEDIATE_START_AC, 1 KEEP_AND_START_AC, 2 DELAY.'
+          format: int32
+        targetTemperature:
+          type: string
+          description: Target cabin temperature serialized as a decimal string (one decimal).
+          example: '21.0'
+        temperatureUnit:
+          type: string
+          description: Temperature unit, `C` or `F`.
+          example: C
+        vin:
+          type: string
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    StopEngineRequest:
+      type: object
+      required:
+      - vin
+      properties:
+        vin:
+          type: string
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        pinHash:
+          type:
+          - string
+          - 'null'
+          description: PIN challenge hash (see PIN Challenge Protocol in the API description).
+          example: q83vEjRWeJA0Ehcm9kZkZw==
+        pinAccessToken:
+          type:
+          - string
+          - 'null'
+          description: Short-lived PIN access token obtained through biometrics (`enableBiometricsForRemote` / `refreshBiometricsTokenForRemote`). Alternative to `pinHash`.
+        cancelFlag:
+          type:
+          - integer
+          - 'null'
+          default: 0
+          description: 'For stopEngine/stopClimate: 0 IMMEDIATE_STOP_AC, 1 CANCEL_DELAY.'
+    UpdateCurfewAlertRequest:
+      type: object
+      required:
+      - curfewId
+      - curfewStatus
+      - duration
+      - isScheduleWithLocalTime
+      - startDateTime
+      properties:
+        curfewId:
+          type: string
+        curfewName:
+          type:
+          - string
+          - 'null'
+        curfewStatus:
+          type: integer
+          format: int32
+          enum:
+          - 0
+          - 1
+          description: 0 disabled, 1 enabled.
+        days:
+          type: array
+          items:
+            type: string
+        direction:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        duration:
+          type: number
+          format: double
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        isScheduleWithLocalTime:
+          type: boolean
+        startDateTime:
+          type: string
+        supportPollingFlag:
+          type:
+          - boolean
+          - 'null'
+          description: When `true`, the server returns a `requestId` to poll with `getBatchRequestStatus`.
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    UpdateGeofenceAlertRequest:
+      type: object
+      required:
+      - geofenceSpatialDetails
+      - geofenceStatus
+      properties:
+        geofenceId:
+          type:
+          - string
+          - 'null'
+        geofenceName:
+          type:
+          - string
+          - 'null'
+        geofenceSpatialDetails:
+          $ref: '#/components/schemas/GeofenceSpatialDetailsRequestEntity'
+        geofenceStatus:
+          type: integer
+          format: int32
+          enum:
+          - 0
+          - 1
+          description: 0 disabled, 1 enabled.
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        supportPollingFlag:
+          type:
+          - boolean
+          - 'null'
+          description: When `true`, the server returns a `requestId` to poll with `getBatchRequestStatus`.
+        type:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    Vehicle:
+      type: object
+      properties:
+        brands:
+          $ref: '#/components/schemas/VehicleBrandsEntity'
+        defaultVehicleColor:
+          type:
+          - string
+          - 'null'
+        exteriorColor:
+          $ref: '#/components/schemas/VehicleExteriorColor'
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        isFleet:
+          type:
+          - boolean
+          - 'null'
+        isPrimary:
+          type:
+          - boolean
+          - 'null'
+        isSelected:
+          type: boolean
+          default: false
+        isXbadgeFlag:
+          type:
+          - string
+          - boolean
+          - 'null'
+          description: Sent as the string `"true"` or `"false"`; kept permissive.
+        jellybeanModel:
+          $ref: '#/components/schemas/JellybeanEntity'
+        licensePlateNumber:
+          type:
+          - string
+          - 'null'
+        localization:
+          $ref: '#/components/schemas/VehicleLocalizationEntity'
+        metaData:
+          $ref: '#/components/schemas/MetaDataEntity'
+        model:
+          $ref: '#/components/schemas/VehicleModel'
+        modelCode:
+          type:
+          - string
+          - 'null'
+        nickName:
+          type:
+          - string
+          - 'null'
+        otpConfig:
+          $ref: '#/components/schemas/PairVehicleOtpConfig'
+        pairVehicleMethod:
+          type:
+          - string
+          - 'null'
+          description: '0 KeyFob, 1 Otp, 2 Ivi, 3 Icall.'
+        trialEligible:
+          type:
+          - boolean
+          - 'null'
+        userAssociated:
+          type:
+          - boolean
+          - 'null'
+        vehicleConnectivity:
+          $ref: '#/components/schemas/VehicleConnectivity'
+        vehicleCountryCode:
+          type:
+          - string
+          - 'null'
+        vehicleDisplayName:
+          type:
+          - string
+          - 'null'
+        vehicleType:
+          type:
+          - string
+          - 'null'
+          description: '`ice`, `phev` or `ev`.'
+        vin:
+          type: string
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+          default: ''
+    VehicleBrandsEntity:
+      type: object
+      properties:
+        commercial:
+          $ref: '#/components/schemas/CVehicleBrandsCommercialEntity'
+    VehicleConnectivity:
+      type: object
+      properties:
+        state:
+          type:
+          - string
+          - 'null'
+    VehicleCruisingRangeEntity:
+      type: object
+      properties:
+        cruisingRange:
+          type: array
+          items:
+            $ref: '#/components/schemas/VehicleSubCruisingRangeEntity'
+        id:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+    VehicleExteriorColor:
+      type: object
+      properties:
+        code:
+          type:
+          - string
+          - 'null'
+        description:
+          type:
+          - string
+          - 'null'
+    VehicleListResponse:
+      type: object
+      properties:
+        callCenterLanguage:
+          type:
+          - string
+          - 'null'
+        setPINFlag:
+          type:
+          - boolean
+          - 'null'
+        vehicles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Vehicle'
+        vinList:
+          type: array
+          items:
+            $ref: '#/components/schemas/InternalVinEntity'
+    VehicleLocalizationEntity:
+      type: object
+      properties:
+        iso2DeliveryCountryCode:
+          type:
+          - string
+          - 'null'
+        iso2UsageCountryCode:
+          type:
+          - string
+          - 'null'
+        region:
+          type:
+          - string
+          - 'null'
+    VehicleLocationItem:
+      type: object
+      properties:
+        lastUpdateDateTime:
+          type:
+          - string
+          - 'null'
+        value:
+          type:
+          - number
+          - 'null'
+          format: double
+    VehicleLocationResponse:
+      type: object
+      properties:
+        isValidPIN:
+          type:
+          - boolean
+          - 'null'
+          default: true
+        locationLatitude:
+          $ref: '#/components/schemas/VehicleLocationItem'
+        locationLongitude:
+          $ref: '#/components/schemas/VehicleLocationItem'
+        timestamp:
+          type:
+          - string
+          - 'null'
+    VehicleModel:
+      type: object
+      properties:
+        bodyWork:
+          type:
+          - string
+          - 'null'
+        family:
+          type:
+          - string
+          - 'null'
+        modelYear:
+          type:
+          - string
+          - 'null'
+        phase:
+          type:
+          - string
+          - 'null'
+    VehicleSubCruisingRangeEntity:
+      type: object
+      properties:
+        engineType:
+          $ref: '#/components/schemas/VsrMetric'
+        range_2:
+          $ref: '#/components/schemas/VsrMetric'
+        range_3:
+          $ref: '#/components/schemas/VsrMetric'
+    VehicleTireEntity:
+      type: object
+      properties:
+        position:
+          $ref: '#/components/schemas/VsrMetric'
+        pressure:
+          $ref: '#/components/schemas/VsrMetric'
+        pressureValue:
+          $ref: '#/components/schemas/VsrMetric'
+    VehicleTireStatusEntity:
+      type: object
+      properties:
+        id:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+        tires:
+          type: array
+          items:
+            $ref: '#/components/schemas/VehicleTireEntity'
+    VerifyPinRequest:
+      type: object
+      required:
+      - vin
+      - pinHash
+      properties:
+        internalVin:
+          type:
+          - string
+          - 'null'
+          description: Internal VIN from `getVehicleList` (`vinList`), omitted when not provided.
+          example: JA4XXXXXXXXXXXXXX
+        pinHash:
+          type: string
+          description: PIN challenge hash (see PIN Challenge Protocol in the API description).
+          example: q83vEjRWeJA0Ehcm9kZkZw==
+        vin:
+          type: string
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    VerifyPinResponse:
+      type: object
+      properties:
+        isValidPIN:
+          type:
+          - boolean
+          - 'null'
+          default: true
+    VsrData:
+      type: object
+      properties:
+        diagnostic:
+          $ref: '#/components/schemas/VsrDiagnostic'
+        message:
+          type:
+          - string
+          - 'null'
+        vehicleStatus:
+          $ref: '#/components/schemas/VsrVehicleStatus'
+    VsrDiagnostic:
+      type: object
+      properties:
+        absWarn:
+          $ref: '#/components/schemas/VsrMetric'
+        afuFailure:
+          $ref: '#/components/schemas/VsrMetric'
+        airbagWarn:
+          $ref: '#/components/schemas/VsrMetric'
+        availRange:
+          $ref: '#/components/schemas/VsrMetric'
+        batteryHighWarning:
+          $ref: '#/components/schemas/VsrMetric'
+        batteryLife:
+          $ref: '#/components/schemas/VsrMetric'
+        batteryLowWarning:
+          $ref: '#/components/schemas/VsrMetric'
+        breakWarn:
+          $ref: '#/components/schemas/VsrMetric'
+        cruisingRangeFirst:
+          $ref: '#/components/schemas/VehicleCruisingRangeEntity'
+        cruisingRangeSecond:
+          $ref: '#/components/schemas/VehicleCruisingRangeEntity'
+        digsts:
+          type:
+          - string
+          - 'null'
+        dtcStatus:
+          $ref: '#/components/schemas/VsrMetric'
+        emergencyBrakingWarning:
+          $ref: '#/components/schemas/VsrMetric'
+        engineOilWarn:
+          $ref: '#/components/schemas/VsrMetric'
+        evAlertCrbsFailureDisplay:
+          $ref: '#/components/schemas/VsrMetric'
+        evBatteryLevelWarning:
+          $ref: '#/components/schemas/VsrMetric'
+        eventTimestamp:
+          $ref: '#/components/schemas/VsrMetric'
+        fuelLevel:
+          $ref: '#/components/schemas/VsrMetric'
+        igst:
+          $ref: '#/components/schemas/VsrMetric'
+        milStatus:
+          $ref: '#/components/schemas/VsrMetric'
+        odo:
+          $ref: '#/components/schemas/VsrMetric'
+        odos:
+          $ref: '#/components/schemas/VsrMetric'
+        powerLimitationAlert:
+          $ref: '#/components/schemas/VsrMetric'
+        powerSteeringWarning:
+          $ref: '#/components/schemas/VsrMetric'
+        spd:
+          $ref: '#/components/schemas/VsrMetric'
+        tireStatus:
+          $ref: '#/components/schemas/VehicleTireStatusEntity'
+        v2LSystemStatusDisplay:
+          $ref: '#/components/schemas/VsrMetric'
+        washerWarn:
+          $ref: '#/components/schemas/VsrMetric'
+    VsrDoorStatus:
+      type: object
+      properties:
+        doors:
+          type: array
+          items:
+            $ref: '#/components/schemas/VsrStateItem'
+        id:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+    VsrLightStatus:
+      type: object
+      properties:
+        id:
+          type:
+          - string
+          - 'null'
+        lights:
+          type: array
+          items:
+            $ref: '#/components/schemas/VsrStateItem'
+        name:
+          type:
+          - string
+          - 'null'
+    VsrMetric:
+      type: object
+      properties:
+        displayMessage:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+        value:
+          type:
+          - string
+          - 'null'
+        warning:
+          type:
+          - boolean
+          - string
+          - 'null'
+          description: Usually a boolean, sometimes a string. Kept permissive.
+    VsrPayload:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/VsrData'
+        timestamp:
+          type:
+          - string
+          - 'null'
+        vin:
+          type:
+          - string
+          - 'null'
+          description: 17-character Vehicle Identification Number. Always sent for vehicle-scoped calls.
+          example: JA4XXXXXXXXXXXXXX
+    VsrStateItem:
+      type: object
+      properties:
+        position:
+          $ref: '#/components/schemas/VsrMetric'
+        state:
+          $ref: '#/components/schemas/VsrMetric'
+    VsrVehicleStatus:
+      type: object
+      properties:
+        doorStatus:
+          $ref: '#/components/schemas/VsrDoorStatus'
+        lightStatus:
+          $ref: '#/components/schemas/VsrLightStatus'
+        lockStatus:
+          $ref: '#/components/schemas/VsrMetric'
+        windowStatus:
+          $ref: '#/components/schemas/VsrWindowStatus'
+    VsrWindowStatus:
+      type: object
+      properties:
+        id:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+        windows:
+          type: array
+          items:
+            $ref: '#/components/schemas/VsrStateItem'
+    ErrorCode:
+      type: string
+      enum:
+      - '600001'
+      - '600002'
+      - '600004'
+      - '600005'
+      - '600006'
+      - '600007'
+      - '600044'
+      - '700000'
+      - '401005'
+      - '956000'
+      - '956002'
+      - '956003'
+      - '956005'
+      - '956006'
+      - '956007'
+      - '956008'
+      - '956011'
+      - '956012'
+      - '956013'
+      - '956014'
+      - '956017'
+      - '956018'
+      - '957000'
+      - '958000'
+      - '4'
+      - '5'
+      - '-1'
+      - '-2'
+      - '-3'
+      - '-4'
+      - '-5'
+      - '-6'
+      - '-7'
+      x-enum-varnames:
+      - SESSION_KEY_EXPIRED
+      - FORCE_LOGOUT
+      - RE_LOGIN
+      - FORCE_UPDATE
+      - PIN_ACCESS_TOKEN_EXPIRED
+      - PIN_REFRESH_TOKEN_EXPIRED
+      - ACCESS_TOKEN_REQUIRED
+      - APP_MAINTENANCE
+      - REQUEST_TIME_VALID_FAILED
+      - PIN_VERIFY_FAILED
+      - MY_QTOKEN_REQUIRED
+      - CHECK_USER_RESIDENCE
+      - MIGRATION_FAILED
+      - PURCHASE_FAILED
+      - PURCHASE_SUCCEED
+      - PURCHASE_TIMEOUT
+      - INVALID_ZIP_CODE
+      - INVALID_ADDRESS_LINE
+      - INVALID_STATE
+      - INVALID_CITY
+      - CHARGING_IN_PROGRESS
+      - MY_QREFRESH_TOKEN_EXPIRED
+      - PAIR_VEHICLE_REQUEST_ID_EXPIRED
+      - PAIR_VEHICLE_OTP_CODE_WRONG
+      - STRIPE_UNKNOWN_FAILED
+      - FIND_MY_CAR_UNKNOWN_FAILED
+      - INTERNAL_SERVER_ERROR
+      - NETWORK_ERROR
+      - INVALID_DATA_FORMAT_ERROR
+      - CONFIG_SETUP_ERROR
+      - TIMEOUT_ERROR
+      - UNKNOWN_ERROR
+      - CONFIG_NOT_INITIALIZED
+      x-enum-descriptions:
+      - Kintaro session key (`encKey`/`signKey`) expired or unknown. Re-run `POST /service/checkVersion` and retry.
+      - '`ForceLogout`: IDM access token expired or revoked. Refresh it with `/api/v1/refreshToken`, otherwise log in again.'
+      - '`ReLogin`: session invalidated (for example the account logged in on another device; one session per account). Refresh the token or log in again.'
+      - '`ForceUpdate`: the app version sent in the headers is no longer supported.'
+      - '`PinAccessTokenExpired`: the biometrics `pinAccessToken` expired. Retry with a `pinHash` or refresh it with `refreshBiometricsTokenForRemote`.'
+      - '`PinRefreshTokenExpired`: the biometrics PIN refresh token expired. Re-enable biometrics (`enableBiometricsForRemote`).'
+      - '`AccessTokenRequired`: `knt-access-token` missing for an authenticated endpoint.'
+      - '`AppMaintenance`: backend under maintenance.'
+      - '`RequestTimeValidFailed`: request timestamp rejected (clock skew or replay). Clients should treat it as a forced logout.'
+      - '`PinVerifyFailed`: wrong security PIN (`pinHash` mismatch).'
+      - '`MyQTokenRequired`: no myQ account linked or its token is missing.'
+      - '`CheckUserResidence`: residence country check required (getProfile with `checkResidenceFlag`).'
+      - '`MigrationFailed`: payment / account migration failed.'
+      - '`PurchaseFailed`: the purchase failed.'
+      - '`PurchaseSucceed`: purchase completed (status code reported through the error channel).'
+      - '`PurchaseTimeout`: purchase still pending after the timeout.'
+      - '`InvalidZipCode`: address validation rejected the postal code.'
+      - '`InvalidAddressLine`: address validation rejected the street line.'
+      - '`InvalidState`: address validation rejected the state / province.'
+      - '`InvalidCity`: address validation rejected the city.'
+      - '`ChargingInProgress`: Plug & Charge operation refused while a charging session is in progress.'
+      - '`MyQRefreshTokenExpired`: myQ refresh token expired; relink the myQ account.'
+      - '`PairVehicleRequestIdExpired`: pairing `requestId` expired; restart pairing.'
+      - '`PairVehicleOtpCodeWrong`: wrong pairing OTP code (attempts are limited by `otpConfig.maxWrongTimes`).'
+      - '`StripeUnknownFailed`: client-side code for Stripe failures, never returned by the server.'
+      - '`FindMyCarUnknownFailed`: client-side code for Find My Car failures, never returned by the server.'
+      - '`INTERNAL_SERVER_ERROR`: Client-side transport error, produced on the device for transport failures, never returned by the server.'
+      - '`NETWORK_ERROR`: Client-side transport error, produced on the device for transport failures, never returned by the server.'
+      - '`INVALID_DATA_FORMAT_ERROR`: Client-side transport error, produced on the device for transport failures, never returned by the server.'
+      - '`CONFIG_SETUP_ERROR`: Client-side transport error, produced on the device for transport failures, never returned by the server.'
+      - '`TIMEOUT_ERROR`: Client-side transport error, produced on the device for transport failures, never returned by the server.'
+      - '`UNKNOWN_ERROR`: Client-side transport error, produced on the device for transport failures, never returned by the server.'
+      - '`CONFIG_NOT_INITIALIZED`: Client-side transport error, produced on the device for transport failures, never returned by the server.'
+      description: |-
+        Kintaro `errorCode` values. `600001`, `600002`, `600004`, `600005`, `600044`, `700000` and `401005` can be returned by any Kintaro endpoint; the other server codes are endpoint specific (see `x-error-codes`). `4`, `5` and `-1` to `-7` are produced on the device and never sent by the server.
+
+        | Code | App name | Meaning |
+        |---|---|---|
+        | `600001` | (transport, / `p017b`) | Kintaro session key (`encKey`/`signKey`) expired or unknown. Re-run `POST /service/checkVersion` and retry. |
+        | `600002` | ForceLogout | IDM access token expired or revoked. Refresh it with `/api/v1/refreshToken`, otherwise log in again. |
+        | `600004` | ReLogin | session invalidated (for example the account logged in on another device; one session per account). Refresh the token or log in again. |
+        | `600005` | ForceUpdate | the app version sent in the headers is no longer supported. |
+        | `600006` | PinAccessTokenExpired | the biometrics `pinAccessToken` expired. Retry with a `pinHash` or refresh it with `refreshBiometricsTokenForRemote`. |
+        | `600007` | PinRefreshTokenExpired | the biometrics PIN refresh token expired. Re-enable biometrics (`enableBiometricsForRemote`). |
+        | `600044` | AccessTokenRequired | `knt-access-token` missing for an authenticated endpoint. |
+        | `700000` | AppMaintenance | backend under maintenance. |
+        | `401005` | RequestTimeValidFailed | request timestamp rejected (clock skew or replay). Clients should treat it as a forced logout. |
+        | `956000` | PinVerifyFailed | wrong security PIN (`pinHash` mismatch). |
+        | `956002` | MyQTokenRequired | no myQ account linked or its token is missing. |
+        | `956003` | CheckUserResidence | residence country check required (getProfile with `checkResidenceFlag`). |
+        | `956005` | MigrationFailed | payment / account migration failed. |
+        | `956006` | PurchaseFailed | the purchase failed. |
+        | `956007` | PurchaseSucceed | purchase completed (status code reported through the error channel). |
+        | `956008` | PurchaseTimeout | purchase still pending after the timeout. |
+        | `956011` | InvalidZipCode | address validation rejected the postal code. |
+        | `956012` | InvalidAddressLine | address validation rejected the street line. |
+        | `956013` | InvalidState | address validation rejected the state / province. |
+        | `956014` | InvalidCity | address validation rejected the city. |
+        | `956017` | ChargingInProgress | Plug & Charge operation refused while a charging session is in progress. |
+        | `956018` | MyQRefreshTokenExpired | myQ refresh token expired; relink the myQ account. |
+        | `957000` | PairVehicleRequestIdExpired | pairing `requestId` expired; restart pairing. |
+        | `958000` | PairVehicleOtpCodeWrong | wrong pairing OTP code (attempts are limited by `otpConfig.maxWrongTimes`). |
+        | `4` | StripeUnknownFailed | client-side code for Stripe failures, never returned by the server. |
+        | `5` | FindMyCarUnknownFailed | client-side code for Find My Car failures, never returned by the server. |
+        | `-1` | INTERNAL_SERVER_ERROR | Client-side transport error, produced on the device for transport failures, never returned by the server. |
+        | `-2` | NETWORK_ERROR | Client-side transport error, produced on the device for transport failures, never returned by the server. |
+        | `-3` | INVALID_DATA_FORMAT_ERROR | Client-side transport error, produced on the device for transport failures, never returned by the server. |
+        | `-4` | CONFIG_SETUP_ERROR | Client-side transport error, produced on the device for transport failures, never returned by the server. |
+        | `-5` | TIMEOUT_ERROR | Client-side transport error, produced on the device for transport failures, never returned by the server. |
+        | `-6` | UNKNOWN_ERROR | Client-side transport error, produced on the device for transport failures, never returned by the server. |
+        | `-7` | CONFIG_NOT_INITIALIZED | Client-side transport error, produced on the device for transport failures, never returned by the server. |
+    KintaroError:
+      type: object
+      required:
+      - errorCode
+      description: Error fields of a failed Kintaro envelope.
+      properties:
+        errorCode:
+          $ref: '#/components/schemas/ErrorCode'
+        errorTitle:
+          type:
+          - string
+          - 'null'
+          description: Localized dialog title.
+        error:
+          type:
+          - string
+          - 'null'
+          description: Localized error message (`errorMessage` in ).
+        errorForDisplay:
+          type:
+          - string
+          - 'null'
+        extraCode:
+          type:
+          - string
+          - 'null'
+        extraMessage:
+          type:
+          - string
+          - 'null'
+    KintaroEnvelope:
+      type: object
+      required:
+      - state
+      description: 'Raw Kintaro HTTP body before decryption. HTTP status is 200 for business errors too: check `state`. The operations in this document describe the decrypted `payload` only.'
+      properties:
+        state:
+          type: string
+          enum:
+          - S
+          - F
+          description: '`S` success, `F` failure.'
+        payload:
+          type:
+          - string
+          - 'null'
+          description: 'AES-128-CBC + Base64 encrypted JSON payload (plain JSON when `knt-api-response-mode: PLAINTEXT`).'
+        errorCode:
+          type:
+          - string
+          - 'null'
+          description: See `ErrorCode`.
+        error:
+          type:
+          - string
+          - 'null'
+        errorForDisplay:
+          type:
+          - string
+          - 'null'
+        errorTitle:
+          type:
+          - string
+          - 'null'
+        extraCode:
+          type:
+          - string
+          - 'null'
+        extraMessage:
+          type:
+          - string
+          - 'null'
+    IdmEnvelope:
+      type: object
+      required:
+      - payload
+      description: 'Raw IDM HTTP body (/ ): AES-256-ECB + PKCS7 + Base64 encrypted JSON.'
+      properties:
+        payload:
+          type: string
+    IdmResultCode:
+      type: string
+      enum:
+      - '200'
+      - '401'
+      x-enum-varnames:
+      - SUCCESS
+      - UNAUTHORIZED
+      x-enum-descriptions:
+      - Success.
+      - 'Access token invalid or expired: call `/api/v1/refreshToken`.'
+      description: Known IDM `code` values. Other codes carry a server `message` / `error_description`.

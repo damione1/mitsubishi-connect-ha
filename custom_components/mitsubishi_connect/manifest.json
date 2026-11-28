@@ -1,0 +1,12 @@
+{
+  "domain": "mitsubishi_connect",
+  "name": "Mitsubishi Connect",
+  "codeowners": ["@damione1"],
+  "config_flow": true,
+  "dependencies": ["frontend", "http"],
+  "documentation": "https://github.com/damione1/mitsubishi-connect-ha",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/damione1/mitsubishi-connect-ha/issues",
+  "requirements": [],
+  "version": "0.1.6"
+}

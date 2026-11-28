@@ -1,0 +1,21 @@
+[project]
+name = "mitsubishi-connect-ha-workspace"
+version = "0.1.0"
+description = "OpenAPI spec, generated Python client, and interactive CLI for Mitsubishi Motors Connected Services"
+requires-python = ">=3.11"
+dependencies = [
+    "mitsubishi-connect",
+    "mitsubishi-connect-cli",
+]
+
+[tool.uv.workspace]
+members = [
+    "generated/mitsubishi_connect_api",
+    "client",
+    "cli",
+]
+
+[tool.uv.sources]
+mitsubishi-connect-api = { workspace = true }
+mitsubishi-connect = { workspace = true }
+mitsubishi-connect-cli = { workspace = true }

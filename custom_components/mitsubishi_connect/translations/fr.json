@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connexion à Mitsubishi Connect",
+        "description": "Utilisez un compte conducteur secondaire dédié créé dans l'application officielle Mitsubishi Motors afin d'éviter d'être déconnecté sur votre téléphone.",
+        "data": {
+          "region": "Région",
+          "email": "Courriel",
+          "password": "Mot de passe",
+          "pin": "NIP de sécurité à 4 chiffres (optionnel, requis pour démarrage moteur et déverrouillage)",
+          "scan_interval": "Intervalle de polling passif (minutes, min 15)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Réauthentification Mitsubishi Connect",
+        "description": "Votre session Mitsubishi Connect pour {email} a expiré ou a été déconnectée. Saisissez votre mot de passe pour vous reconnecter.",
+        "data": {
+          "password": "Mot de passe"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Courriel ou mot de passe invalide.",
+      "cannot_connect": "Impossible de joindre les serveurs Mitsubishi Connect.",
+      "unknown": "Erreur inattendue."
+    },
+    "abort": {
+      "already_configured": "Ce compte Mitsubishi Connect est déjà configuré.",
+      "reauth_successful": "Réauthentification réussie."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options Mitsubishi Connect",
+        "data": {
+          "pin": "NIP de sécurité à 4 chiffres",
+          "scan_interval": "Intervalle de polling passif (minutes, min 15)",
+          "temperature_unit": "Unité de température habitacle"
+        }
+      }
+    }
+  }
+}
